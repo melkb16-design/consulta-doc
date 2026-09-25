@@ -8,17 +8,24 @@ const crypto = require('crypto');
 const multer = require('multer');
 const { execFile } = require('child_process');
 const fs = require('fs');
-
+const admin = require('firebase-admin');
 const db = require('./db');
 const email = require('./services/email');
 const pagamento = require('./services/pagamento');
-
 const app = express();
+
+// Inicializa o Firebase Admin (valida o token do master)
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+  admin.initializeApp({
+    credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT))
+  });
+}
+
 app.use(helmet());
 app.use(cors({ origin: process.env.WEB_URL }));
 app.use(express.json({ limit: '200kb' }));
-
 const upload = multer({ dest: '/tmp/certificados/' });
+
 const VALORES = {
   mensal: Number(process.env.PLANO_MENSAL_VALOR),
   anual: Number(process.env.PLANO_ANUAL_VALOR),
@@ -29,9 +36,40 @@ const BENEFICIOS = {
   anual: ['Tudo do Mensal', '2 meses grátis', 'Certificado A1 incluso', 'Suporte prioritário + consultoria']
 };
 
+/* ---------- configuração dinâmica (tabela config no Postgres) ---------- */
+async function getConfig() {
+  const { rows } = await db.query('SELECT chave, valor FROM config');
+  const c = {};
+  rows.forEach(r => { c[r.chave] = r.valor; });
+  return c;
+}
+
+async function recarregarValores() {
+  const c = await getConfig();
+  if (c.plano_mensal_valor) VALORES.mensal = Number(c.plano_mensal_valor);
+  if (c.plano_anual_valor) VALORES.anual = Number(c.plano_anual_valor);
+  if (c.certificado_a1_valor) VALORES.certificadoA1 = Number(c.certificado_a1_valor);
+  if (c.mp_access_token) process.env.MP_ACCESS_TOKEN = c.mp_access_token;
+}
+
+async function authMaster(req, res, next) {
+  try {
+    if (!admin.apps.length) return res.status(503).json({ erro: 'Firebase não configurado no servidor.' });
+    const t = (req.headers.authorization || '').replace(/^Bearer /, '');
+    if (!t) return res.status(401).json({ erro: 'Não autenticado.' });
+    const decoded = await admin.auth().verifyIdToken(t);
+    if (!process.env.MASTER_EMAIL) return res.status(503).json({ erro: 'Servidor sem MASTER_EMAIL configurado.' });
+    if (decoded.email && decoded.email.toLowerCase() !== process.env.MASTER_EMAIL.toLowerCase())
+      return res.status(403).json({ erro: 'Acesso negado.' });
+    req.master = decoded;
+    next();
+  } catch (e) {
+    return res.status(401).json({ erro: 'Sessão inválida.' });
+  }
+}
+
 /* ---------- utilidades ---------- */
 function assinarJwt(clienteId){ return jwt.sign({ clienteId }, process.env.JWT_SECRET, { expiresIn: '12h' }); }
-
 function auth(req, res, next){
   const h = req.headers.authorization || '';
   const t = h.replace(/^Bearer /, '');
@@ -39,7 +77,6 @@ function auth(req, res, next){
   try{ req.clienteId = jwt.verify(t, process.env.JWT_SECRET).clienteId; next(); }
   catch(e){ return res.status(401).json({ erro: 'Sessão expirada, entre novamente.' }); }
 }
-
 function validarCnpj(c){
   c = (c || '').replace(/\D/g, '');
   return c.length === 14;
@@ -47,7 +84,6 @@ function validarCnpj(c){
 function validarEmail(e){
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e || '');
 }
-
 async function precoResumo(pre, cupom){
   const plano = pre.plano;
   const subtotal = VALORES[plano] + VALORES.certificadoA1;
@@ -67,7 +103,6 @@ async function precoResumo(pre, cupom){
     total: +(subtotal - desc).toFixed(2)
   };
 }
-
 async function criarTokenAcesso(clienteId){
   const token = crypto.randomBytes(32).toString('hex');
   const hash = crypto.createHash('sha256').update(token).digest('hex');
@@ -78,7 +113,6 @@ async function criarTokenAcesso(clienteId){
   );
   return token;
 }
-
 async function enviarLink(cliente, clienteId){
   const token = await criarTokenAcesso(clienteId);
   const link = process.env.WEB_URL + '?tk=' + token;
@@ -129,10 +163,8 @@ app.post('/api/checkout/:token/pagar', async (req, res) => {
     if(!rows[0]) return res.status(404).json({ erro: 'Checkout não encontrado.' });
     const pre = rows[0];
     if(pre.status !== 'aguardando_pagamento') return res.status(409).json({ erro: 'Checkout já processado.' });
-
     const resumo = await precoResumo(pre, pre.cupom);
     const cliente = pre.dados;
-
     // cria cliente no banco aqui (a assinatura já foi paga)
     const { rows: cli } = await db.query(
       `INSERT INTO clientes (razao_social, cnpj, email, plano)
@@ -140,7 +172,6 @@ app.post('/api/checkout/:token/pagar', async (req, res) => {
       [cliente.razaoSocial || cliente.empresa, cliente.cnpj, cliente.email, pre.plano]
     );
     const clienteId = cli[0].id;
-
     // COBRANÇA OFICIAL: assinatura + certificado A1 (mesmo checkout)
     const cob = await pagamento.cobrarCheckout({
       cliente: { id: clienteId, email: cliente.email },
@@ -150,7 +181,6 @@ app.post('/api/checkout/:token/pagar', async (req, res) => {
       cardToken,
       cupom: pre.cupom
     });
-
     await db.query(`UPDATE pre_cadastros SET status = 'pago' WHERE token = $1`, [pre.token]);
     await db.query(
       `INSERT INTO assinaturas (cliente_id, gateway_id, plano, valor, status) VALUES ($1, $2, $3, $4, 'ativo')`,
@@ -160,10 +190,8 @@ app.post('/api/checkout/:token/pagar', async (req, res) => {
       `INSERT INTO pagamentos (cliente_id, gateway_id, tipo, valor, status) VALUES ($1, $2, 'certificado_a1', $3, 'aprovado')`,
       [clienteId, String(cob.paymentA1Id), resumo.certificado.valor]
     );
-
     // e-mail SOMENTE após pagamento confirmado
     await enviarLink(cliente, clienteId);
-
     res.json({ status: 'aprovado', email: cliente.email });
   }catch(e){
     console.error(e);
@@ -221,7 +249,6 @@ app.post('/api/acesso', async (req, res) => {
     );
     if(!rows[0]) return res.status(404).json({ erro: 'Link não encontrado.' });
     if(rows[0].usado || !rows[0].valido) return res.status(410).json({ erro: 'Link inválido ou expirado.' });
-
     const hashSenha = await bcrypt.hash(senha, 12);
     await db.query(
       `INSERT INTO usuarios (cliente_id, identificador, senha_hash) VALUES ($1, $2, $3)
@@ -229,7 +256,6 @@ app.post('/api/acesso', async (req, res) => {
       [rows[0].cliente_id, identificador, hashSenha]
     );
     await db.query(`UPDATE acessos_tokens SET usado = true WHERE token = $1`, [hash]);
-
     const j = jwt.sign({ clienteId: rows[0].cliente_id }, process.env.JWT_SECRET, { expiresIn: '12h' });
     res.json({ token: j, conta: await montarConta(rows[0].cliente_id) });
   }catch(e){ console.error(e); res.status(500).json({ erro: 'Erro interno.' }); }
@@ -272,12 +298,10 @@ async function montarConta(clienteId){
     upgrade: { codigo: outro, rotulo: outro === 'anual' ? 'Plano Anual' : 'Plano Mensal', valor: VALORES[outro] }
   };
 }
-
 app.get('/api/conta', auth, async (req, res) => {
   try{ res.json(await montarConta(req.clienteId)); }
   catch(e){ console.error(e); res.status(500).json({ erro: 'Erro interno.' }); }
 });
-
 app.put('/api/conta', auth, async (req, res) => {
   try{
     const { socioAdministrador, emailResponsavel } = req.body;
@@ -325,18 +349,76 @@ app.post('/api/plano/upgrade', auth, async (req, res) => {
   }catch(e){ console.error(e); res.status(500).json({ erro: 'Erro interno.' }); }
 });
 
-/* ---------- 10) CONFIG PÚBLICA (sem segredos) ---------- */
-app.get('/api/config', (req, res) => {
-  res.json({
-    mpPublicKey: process.env.MP_PUBLIC_KEY,
-    planos: [
-      { codigo: 'mensal', rotulo: 'Plano Mensal', valor: VALORES.mensal },
-      { codigo: 'anual', rotulo: 'Plano Anual', valor: VALORES.anual }
-    ],
-    certificadoA1: { rotulo: 'Certificado Digital A1', valor: VALORES.certificadoA1 }
-  });
+/* ---------- 10) ADMIN (rotas do master, protegidas por Firebase) ---------- */
+app.get('/api/admin/config', authMaster, async (req, res) => {
+  try{
+    const c = await getConfig();
+    res.json({
+      planos: [
+        { codigo: 'mensal', rotulo: 'Plano Mensal', valor: Number(c.plano_mensal_valor) || VALORES.mensal || 0 },
+        { codigo: 'anual', rotulo: 'Plano Anual', valor: Number(c.plano_anual_valor) || VALORES.anual || 0 }
+      ],
+      certificadoA1: { rotulo: 'Certificado Digital A1', valor: Number(c.certificado_a1_valor) || VALORES.certificadoA1 || 0 },
+      mercadopago: {
+        publicKey: c.mp_public_key || process.env.MP_PUBLIC_KEY || '',
+        accessTokenConfigurado: !!(c.mp_access_token || process.env.MP_ACCESS_TOKEN)
+      }
+    });
+  }catch(e){ console.error(e); res.status(500).json({ erro: 'Erro interno.' }); }
 });
 
-app.listen(process.env.PORT || 3000, () => {
+app.put('/api/admin/config', authMaster, async (req, res) => {
+  try{
+    const { planoMensal, planoAnual, certificadoA1, mpPublicKey, mpAccessToken } = req.body;
+    const valores = {};
+    if (planoMensal !== undefined) {
+      const n = Number(planoMensal);
+      if(!isFinite(n)) return res.status(400).json({ erro: 'Valor do plano mensal inválido.' });
+      valores.plano_mensal_valor = String(n);
+    }
+    if (planoAnual !== undefined) {
+      const n = Number(planoAnual);
+      if(!isFinite(n)) return res.status(400).json({ erro: 'Valor do plano anual inválido.' });
+      valores.plano_anual_valor = String(n);
+    }
+    if (certificadoA1 !== undefined) {
+      const n = Number(certificadoA1);
+      if(!isFinite(n)) return res.status(400).json({ erro: 'Valor do certificado A1 inválido.' });
+      valores.certificado_a1_valor = String(n);
+    }
+    if (mpPublicKey !== undefined && String(mpPublicKey).trim()) {
+      valores.mp_public_key = String(mpPublicKey).trim();
+    }
+    if (mpAccessToken !== undefined && String(mpAccessToken).trim()) {
+      valores.mp_access_token = String(mpAccessToken).trim();
+    }
+    for (const [chave, valor] of Object.entries(valores)) {
+      await db.query(
+        `INSERT INTO config (chave, valor) VALUES ($1, $2)
+         ON CONFLICT (chave) DO UPDATE SET valor = EXCLUDED.valor`, [chave, valor]
+      );
+    }
+    await recarregarValores();
+    res.json({ ok: true });
+  }catch(e){ console.error(e); res.status(500).json({ erro: 'Erro interno.' }); }
+});
+
+/* ---------- 11) CONFIG PÚBLICA (sem segredos, lê do banco) ---------- */
+app.get('/api/config', async (req, res) => {
+  try{
+    const c = await getConfig();
+    res.json({
+      mpPublicKey: c.mp_public_key || process.env.MP_PUBLIC_KEY,
+      planos: [
+        { codigo: 'mensal', rotulo: 'Plano Mensal', valor: Number(c.plano_mensal_valor) || VALORES.mensal },
+        { codigo: 'anual', rotulo: 'Plano Anual', valor: Number(c.plano_anual_valor) || VALORES.anual }
+      ],
+      certificadoA1: { rotulo: 'Certificado Digital A1', valor: Number(c.certificado_a1_valor) || VALORES.certificadoA1 }
+    });
+  }catch(e){ console.error(e); res.status(500).json({ erro: 'Erro interno.' }); }
+});
+
+app.listen(process.env.PORT || 3000, async () => {
   console.log('DocFiscal API rodando na porta', process.env.PORT || 3000);
+  try { await recarregarValores(); } catch(e) { console.error('Aviso: não foi possível carregar a tabela config.', e.message); }
 });
