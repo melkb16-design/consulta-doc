@@ -98,3 +98,22 @@ async function trocarPlano({ preapprovalIdAntigo, plano, valorPlano, cliente, ca
 }
 
 module.exports = { cobrarCheckout, trocarPlano };
+
+// Cancela a assinatura no gateway (para de cobrar as próximas parcelas)
+async function cancelarAssinatura(preapprovalId) {
+  if (!preapprovalId) return;
+  const r = await fetch(MP_BASE + '/preapproval/' + preapprovalId, {
+    method: 'PUT',
+    headers: {
+      'Authorization': 'Bearer ' + process.env.MP_ACCESS_TOKEN,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ status: 'cancelled' })
+  });
+  if (!r.ok) {
+    const j = await r.json().catch(() => ({}));
+    throw new Error('Falha ao cancelar assinatura: ' + (j.message || 'erro'));
+  }
+}
+
+module.exports = { cobrarCheckout, trocarPlano, cancelarAssinatura };

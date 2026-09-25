@@ -417,6 +417,54 @@ app.get('/api/config', async (req, res) => {
     });
   }catch(e){ console.error(e); res.status(500).json({ erro: 'Erro interno.' }); }
 });
+/* ---------- CANCELAMENTO DE PLANO ---------- */
+app.post('/api/plano/cancelar', auth, async (req, res) => {
+  try {
+    const { justificativa, detalhes } = req.body;
+    if (!justificativa) return res.status(400).json({ erro: 'Informe o motivo do cancelamento.' });
+
+    // Assinatura ativa mais recente
+    const { rows: ass } = await db.query(
+      `SELECT id, gateway_id, plano, status, criado_em
+       FROM assinaturas WHERE cliente_id = $1 ORDER BY id DESC LIMIT 1`,
+      [req.clienteId]
+    );
+    if (!ass[0]) return res.status(404).json({ erro: 'Nenhuma assinatura ativa encontrada.' });
+    if (ass[0].status === 'cancelada' || ass[0].status === 'cancelamento_solicitado')
+      return res.status(409).json({ erro: 'Esta assinatura já está em cancelamento.' });
+
+    // Acesso até o fim do ciclo já pago (mensal = +1 mês, anual = +12 meses)
+    const ciclo = ass[0].plano === 'anual' ? 12 : 1;
+    const acessoSem = new Date(ass[0].criado_em);
+    acessoSem.setMonth(acessoSem.getMonth() + ciclo);
+
+    // Registra o pedido de cancelamento
+    await db.query(
+      `INSERT INTO cancelamentos (cliente_id, justificativa, detalhes, acesso_ate, status)
+       VALUES ($1, $2, $3, $4, 'solicitado')`,
+      [req.clienteId, justificativa, detalhes || null, acessoSem]
+    );
+
+    // Marca a assinatura como cancelamento solicitado (mantém acesso até o fim do ciclo)
+    await db.query(`UPDATE assinaturas SET status = 'cancelamento_solicitado' WHERE id = $1`, [ass[0].id]);
+
+    // Cancela a cobrança futura no Mercado Pago (para de renovar)
+    try {
+      await pagamento.cancelarAssinatura(ass[0].gateway_id);
+    } catch (e) {
+      console.error('Falha ao cancelar no gateway:', e.message);
+    }
+
+    res.json({
+      ok: true,
+      acessoAte: acessoSem.toISOString(),
+      mensagem: 'Cancelamento solicitado. Seu acesso continua até ' + acessoSem.toLocaleDateString('pt-BR') + '.'
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ erro: 'Erro interno.' });
+  }
+});
 
 app.listen(process.env.PORT || 3000, async () => {
   console.log('DocFiscal API rodando na porta', process.env.PORT || 3000);
